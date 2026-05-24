@@ -6,7 +6,7 @@ Items not implemented due to time/scope. Ordered by priority.
 
 - [ ] **BL-001** Fan-out on write for feeds — on PostMessage, write to per-user inbox sets in Redis. Eliminates JOIN on GetFollowFeed. Required when follower counts grow large.
 - [ ] **BL-002** Cursor-based pagination — replace `offset` with `after_id` (UUID, ULID, or created_at cursor). Eliminates full-table scans for deep pages.
-- [ ] **BL-003** Rate limiting — `slowapi` middleware. PostMessage: 10/min per user. SignIn: 5/min per IP. Prevents abuse and credential stuffing.
+- [x] **BL-003** Rate limiting — `slowapi` middleware. PostMessage: 10/min per user. SignIn: 5/min per IP. Prevents abuse and credential stuffing.
 
 ## Medium Priority
 
