@@ -14,6 +14,7 @@ from app.db.models import User
 from app.db.redis_client import get_redis_pool
 from app.dependencies import get_current_user
 from app.schemas.auth import SignInRequest, SignUpRequest, TokenResponse
+from app.schemas.user import UserOut
 from app.services.auth_service import sign_in, sign_out, sign_up
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -33,6 +34,13 @@ def _extract_jti(request: Request) -> str:
     if jti is None:
         raise UnauthorizedError("Invalid token: missing jti")
     return jti
+
+
+@router.get("/me", response_model=UserOut)
+async def me(
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> UserOut:
+    return UserOut.model_validate(current_user)
 
 
 @router.post("/signup", status_code=status.HTTP_201_CREATED)

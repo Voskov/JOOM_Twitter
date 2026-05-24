@@ -1,17 +1,18 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-from app.db.redis_client import get_redis_pool, close_redis_pool
 from app.core.exceptions import register_exception_handlers
-from app.routers import auth, messages, social, feeds
+from app.db.redis_client import close_redis_pool, get_redis_pool
+from app.routers import auth, feeds, messages, social
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     # startup
     await get_redis_pool()
     yield
@@ -26,11 +27,23 @@ def create_app() -> FastAPI:
         version="1.0.0",
         lifespan=lifespan,
     )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # tighten in production
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     register_exception_handlers(app)
     app.include_router(auth.router)
     app.include_router(messages.router)
     app.include_router(social.router)
     app.include_router(feeds.router)
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
     return app
 
 
