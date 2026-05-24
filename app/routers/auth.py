@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core.exceptions import UnauthorizedError
+from app.core.rate_limit import limiter
 from app.core.security import decode_access_token
 from app.db.database import get_db
 from app.db.models import User
@@ -53,7 +54,9 @@ async def signup(
 
 
 @router.post("/signin", status_code=status.HTTP_200_OK, response_model=TokenResponse)
+@limiter.limit("5/minute")
 async def signin(
+    request: Request,
     body: SignInRequest,
     response: Response,
     db: Annotated[AsyncSession, Depends(get_db)],

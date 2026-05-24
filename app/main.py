@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.exceptions import register_exception_handlers
+from app.core.rate_limit import limiter
 from app.db.redis_client import close_redis_pool, get_redis_pool
 from app.routers import auth, feeds, messages, social
 
@@ -27,6 +28,7 @@ def create_app() -> FastAPI:
         version="1.0.0",
         lifespan=lifespan,
     )
+    app.state.limiter = limiter
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],  # tighten in production

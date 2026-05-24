@@ -3,10 +3,11 @@ from __future__ import annotations
 from typing import Annotated
 
 import redis.asyncio as aioredis
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.rate_limit import _get_user_or_ip, limiter
 from app.db.database import get_db
 from app.db.models import User
 from app.db.redis_client import get_redis_pool
@@ -22,7 +23,9 @@ class MessageCreate(BaseModel):
 
 
 @router.post("", status_code=status.HTTP_201_CREATED, response_model=MessageOut)
+@limiter.limit("10/minute", key_func=_get_user_or_ip)
 async def create_message(
+    request: Request,
     body: MessageCreate,
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
