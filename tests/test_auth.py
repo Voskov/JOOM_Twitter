@@ -57,7 +57,9 @@ async def test_signin_success(client: AsyncClient) -> None:
 async def test_signin_wrong_password(client: AsyncClient) -> None:
     username = _unique()
     await client.post("/auth/signup", json={"username": username, "password": "password123"})
-    resp = await client.post("/auth/signin", json={"username": username, "password": "wrongpassword"})
+    resp = await client.post(
+        "/auth/signin", json={"username": username, "password": "wrongpassword"}
+    )
     assert resp.status_code == 401
 
 

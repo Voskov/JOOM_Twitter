@@ -10,7 +10,9 @@ def _uid(prefix: str = "feeduser") -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
 
 
-async def _register_and_login(client: AsyncClient, username: str, password: str = "password123") -> str:
+async def _register_and_login(
+    client: AsyncClient, username: str, password: str = "password123"
+) -> str:
     """Sign up, sign in, and return the bearer token."""
     await client.post("/auth/signup", json={"username": username, "password": password})
     resp = await client.post("/auth/signin", json={"username": username, "password": password})
@@ -82,8 +84,10 @@ async def test_follow_feed_shows_followed_user_posts(client: AsyncClient) -> Non
     post_resp = await client.post("/messages", json={"content": content}, headers=followed_headers)
     assert post_resp.status_code == 201
 
-    # Follower's follow feed should include that message (use offset=1 to bypass cache)
-    resp = await client.get("/feed/following", params={"limit": 50, "offset": 1}, headers=follower_headers)
+    # Fresh unique user — no cache populated yet; offset=0 hits DB directly on miss
+    resp = await client.get(
+        "/feed/following", params={"limit": 50, "offset": 0}, headers=follower_headers
+    )
     assert resp.status_code == 200
     items = resp.json()["items"]
     contents = [item["content"] for item in items]
@@ -132,9 +136,9 @@ async def test_follow_then_unfollow(client: AsyncClient) -> None:
     content = f"followed post {uuid.uuid4().hex[:6]}"
     await client.post("/messages", json={"content": content}, headers=followed_headers)
 
-    # Verify it shows in the follow feed (bypass cache with offset=1)
+    # Fresh unique user — cache miss at offset=0 hits DB directly
     feed_resp = await client.get(
-        "/feed/following", params={"limit": 50, "offset": 1}, headers=follower_headers
+        "/feed/following", params={"limit": 50, "offset": 0}, headers=follower_headers
     )
     assert feed_resp.status_code == 200
     assert any(item["content"] == content for item in feed_resp.json()["items"])
