@@ -1,138 +1,191 @@
 # Architectural Decision Log
 
-Honest notes on the choices made during design. Written as I would explain them to another engineer on the team, not as marketing copy.
+Decision records for the key engineering choices made during implementation. Each record captures the context, the choice, and the trade-offs accepted. Written in ADR-lite format.
 
 ---
 
-## 1. Why FastAPI over Flask/Django?
+## Decision 1: Async runtime (FastAPI + asyncio) over synchronous frameworks
 
-FastAPI was the obvious call for a pure async JSON API.
+**Status:** Accepted
 
-Django is a batteries-included web framework designed around the MVC pattern and server-rendered HTML. We don't need the ORM abstraction (we're using SQLAlchemy directly), we don't need the admin panel, we don't need the template engine, and the Django async story — while improving — still has rough edges. It adds significant weight for zero benefit here.
+**Context:**
+The spec called for high concurrency on a read-heavy social API. The dominant bottleneck for this workload is I/O: Postgres queries and Redis calls. In a synchronous WSGI model, each in-flight request holds an OS thread for its entire duration — including the time spent blocked waiting for I/O. Threads are expensive (~1MB stack each), and the GIL prevents true CPU parallelism in CPython. The thread-per-request ceiling is a real constraint at scale.
 
-Flask is lighter, but its async support is bolted on. `flask[async]` wraps async route handlers by running them in a thread pool, which defeats the point. You lose the concurrency benefits entirely.
+Flask was rejected because its async support (`flask[async]`) wraps `async def` handlers in a thread pool — you get the syntactic cost of async without the concurrency benefit. Django carries significant weight (ORM, admin, templates, user model) that adds zero value for a pure JSON API.
 
-FastAPI gives us:
-- Native async/await support with no workarounds
-- Pydantic v2 for request/response validation with zero boilerplate
-- OpenAPI schema generated automatically from type hints — free Swagger UI with no extra code
-- Dependency injection that composes cleanly (auth middleware, DB sessions)
-- Type-hint-first design that works well with mypy
+**Decision:**
+Use FastAPI with `async def` route handlers running on an asyncio event loop (uvicorn ASGI server). All I/O — Postgres via `asyncpg`, Redis via `redis-py` async client — is genuinely non-blocking. The one CPU-bound operation (bcrypt password hashing) is offloaded to the thread pool executor via `asyncio.to_thread()`.
 
-The only trade-off is that FastAPI is a younger project than Django or Flask, and some edge cases in the docs can be sparse. Not a problem at this scale.
-
----
-
-## 2. Why async?
-
-This is a social API that is heavily read-biased. At any realistic load, 90%+ of request time is spent waiting — waiting for a Postgres query to return, waiting for a Redis GET. The CPU is idle.
-
-In a synchronous WSGI model (Flask, Django without async), each request holds an OS thread for its entire lifetime. Threads are not cheap: each one consumes around 1MB of stack memory and adds context-switch overhead to the OS scheduler. At 1,000 concurrent users, you need 1,000 threads — most of them sitting idle waiting for network I/O.
-
-With an async event loop, a single thread handles all of that by interleaving coroutines. While coroutine A awaits a DB response, the event loop runs coroutine B. Practically, this means an async server can handle thousands of concurrent connections that a synchronous server would need hundreds of threads to manage.
-
-The gains are not free — async code is harder to reason about, tracing stack traces through await chains is annoying, and any blocking call in a route handler stalls the entire event loop. We handle the one CPU-bound operation (bcrypt hashing) by offloading it to `asyncio.to_thread()`. Everything else — DB, Redis, JSON serialization — is genuinely I/O-bound and benefits from the async model.
+**Consequences:**
+- A single event loop thread can interleave thousands of concurrent in-flight requests, all blocked on I/O simultaneously.
+- Debugging is harder: stack traces through `await` chains are long and can be confusing.
+- Any accidentally blocking call in a route handler (e.g., a synchronous DB driver) stalls the entire event loop, not just one request. Requires discipline in library selection.
+- Test infrastructure requires async-aware tooling: `pytest-asyncio` and `httpx.AsyncClient` instead of `TestClient`.
 
 ---
 
-## 3. Why JWT over session tokens?
+## Decision 2: JWT authentication with dual delivery (header + httpOnly cookie)
 
-Session tokens require a session store. Every authenticated request has to look up the session ID in that store (Postgres or Redis) to find out who the user is. That is an extra round-trip — or it means you're coupling your auth to a specific infrastructure component.
+**Status:** Accepted
 
-JWT is stateless. The token itself contains the user identity (`sub` claim). Any app server can validate it with just the secret key. No session store, no shared state across instances. This makes horizontal scaling trivial: add more app containers and they all validate tokens independently.
+**Context:**
+The API needs to authenticate requests. Session tokens require a session store — every request must look up the session ID to find the user identity, adding a mandatory round-trip. Stateless JWTs carry the identity in the token itself and can be validated by any app server using just the secret key, with no shared state. This makes horizontal scaling straightforward.
 
-The obvious downside of stateless JWT is that you cannot instantly revoke a token. If a user signs out, the token remains valid until it expires. For a 1-hour TTL, that is up to an hour of exposure.
+Browser clients have a different security concern: storing a JWT in `localStorage` or `sessionStorage` exposes it to JavaScript, making it vulnerable to XSS attacks. An `httpOnly` cookie is inaccessible to JavaScript, closing that attack vector.
 
-We address this with a Redis blacklist keyed by `jti` (JWT ID). Sign-out writes the jti to Redis with a TTL matching the token's remaining lifetime. Every auth check queries Redis for the jti before proceeding. This gives us real sign-out semantics without the overhead of a full session store — the blacklist is tiny (one key per active signed-out token) and is queried with a sub-millisecond Redis GET.
+**Decision:**
+Use stateless JWT (HS256) with dual delivery: `Authorization: Bearer <token>` header for API clients and Swagger UI, and an `httpOnly; SameSite=Lax` cookie for browser clients. The auth middleware checks the header first and falls back to the cookie. Either one is sufficient to authenticate a request.
 
-The net result: stateless by default (fast, horizontally scalable), with targeted revocation for sign-out (correct behavior without the full session-store cost).
+HS256 was chosen over RS256 because this is a single-service deployment. RS256's asymmetric key distribution is valuable when multiple independent services need to verify the same tokens without sharing a secret. With one service, HS256 is simpler and computationally cheaper with equivalent security given a strong secret.
 
----
-
-## 4. Why Redis for the blacklist vs Postgres?
-
-The blacklist check happens on every single authenticated request, before any application logic runs. It is on the hot path.
-
-If we put the blacklist in Postgres, every request adds a `SELECT` to a `token_blacklist` table. At moderate load (500 req/s), that is 500 extra queries per second — queries that return one row and do almost nothing useful. Postgres query round-trip latency is typically 5–20ms. That adds 5–20ms to every request.
-
-Redis GET latency is sub-millisecond (typically 0.1–0.5ms on localhost, 1–2ms over a local network). It is designed precisely for this kind of high-frequency key lookup.
-
-Additionally, Redis TTL-based key expiry handles cleanup automatically. Expired token blacklist entries vanish on their own. In Postgres, we'd need a cron job or background task to purge old rows.
-
-The only downside: Redis is a second infrastructure dependency. We already need it for feed caching, so this adds no new dependency. The call was easy.
+**Consequences:**
+- Stateless validation means no session store lookup overhead on the primary auth path.
+- Horizontal scaling is trivial: any app instance can validate any token.
+- Browser clients get XSS-resistant token storage via httpOnly cookies at no extra implementation cost.
+- Cookie delivery requires HTTPS in production (httpOnly provides no protection over plaintext HTTP). Tracked as BL-013.
+- HS256 requires the secret key to remain secret. If the key is compromised, all tokens issued with it are compromised. Key rotation requires re-issuing all active tokens.
 
 ---
 
-## 5. Why pull model for feeds?
+## Decision 3: Redis for JWT token blacklist, not Postgres
 
-There are two classic approaches to feed generation:
+**Status:** Accepted
 
-**Fan-out on write (push model):** When a user posts, immediately write that post to the inbox of every one of their followers. GetFollowFeed becomes a simple inbox read.
+**Context:**
+Stateless JWT cannot natively revoke a token before its expiry. Sign-out must have real semantics: a signed-out token cannot be reused, even within its TTL window. The `jti` (JWT ID) claim — a unique UUID embedded in each token at issuance — provides the handle for revocation.
 
-**Fan-out on read (pull model):** When a user posts, just insert the message. When a follower requests their feed, JOIN follows→messages to build the feed at query time.
+The blacklist check runs on every single authenticated request, before any application logic. It is on the hot path. The question is where to store it.
 
-Fan-out on write sounds appealing because reads are O(1), but the write cost is brutal at scale. If a user has 100,000 followers and posts a message, that is 100,000 Redis writes (or DB inserts) synchronously on the write path. For a celebrity-tier account (1M+ followers), this is a major problem — it either slows posting to a crawl, or you need a complex async job queue with delivery guarantees.
+**Decision:**
+Store the blacklist in Redis as `blacklist:{jti}` keys with a TTL equal to the token's remaining lifetime. On sign-out, compute the remaining lifetime from the token's `exp` claim and call `SETEX blacklist:{jti} <remaining_seconds> "1"`. On every auth check, call `GET blacklist:{jti}` and reject if the key exists.
 
-Pull model writes are O(1): insert the message, done. Reads require a JOIN, but at this scale (thousands of users, not millions), that JOIN is fast — especially with the composite index on `(user_id, created_at DESC)`. Redis caching further reduces how often we hit Postgres at all.
+Redis GET latency is sub-millisecond (0.1–0.5ms locally, 1–2ms over a network). Postgres query round-trip is 5–20ms even for a trivial index lookup. At 500 req/s, using Postgres for this lookup would add 2,500–10,000ms of cumulative latency per second across all requests.
 
-The pull model is simpler to implement correctly. For a v1 where we don't know follower count distribution, it is the right default. Fan-out on write is backlogged as BL-001 with clear upgrade criteria: implement it when follower counts grow large enough that cache miss rates drive unacceptable query latency.
+TTL-based key expiry means Redis automatically purges blacklist entries when the corresponding token would have expired anyway. No cleanup job is needed. The blacklist stays bounded to the number of tokens that have been explicitly revoked but not yet naturally expired — typically a very small set.
 
----
-
-## 6. Why not paginate with cursors?
-
-Cursor-based pagination (keyset pagination) is better than offset pagination for most production use cases. Offset is O(n) — a `LIMIT 20 OFFSET 1000` query still reads and discards 1,000 rows. Cursor-based pagination with an indexed column (`WHERE created_at < :cursor ORDER BY created_at DESC LIMIT 20`) is O(1) regardless of page depth.
-
-We used offset pagination for one reason: time. Implementing cursor pagination correctly — especially with the UUID/timestamp edge cases and the client-side state management — takes more care than offset. At the current scale (pages are shallow, datasets are small), offset pagination is not a performance problem.
-
-This is technical debt, acknowledged and tracked as BL-002. The right fix is to switch `offset` to an `after_id` cursor, use ULIDs or a composite `(created_at, id)` cursor to handle ties, and update the response schema to include the next cursor. Not hard, just not prioritized here.
+**Consequences:**
+- Auth check overhead is sub-millisecond rather than 5–20ms.
+- No cleanup job or background worker needed to purge expired blacklist entries.
+- Redis is a second infrastructure dependency. Mitigated by the fact that Redis is already required for feed caching, so no new dependency is introduced.
+- If Redis becomes unavailable, the blacklist check fails. The auth middleware must decide: fail open (allow potentially revoked tokens) or fail closed (reject all authenticated requests). Currently configured to fail closed — a Redis outage makes auth checks fail, which is safer.
 
 ---
 
-## 7. Why uv over Poetry?
+## Decision 4: Pull model (fan-out on read) for following feed
 
-Poetry was the standard choice for Python packaging for a few years, but it has accumulated known issues: slow dependency resolution on complex trees, inconsistent lock file behavior across platforms, and occasional resolver bugs that require manual workarounds.
+**Status:** Accepted
 
-`uv` is a Rust-based Python package manager from Astral (the team behind ruff). It is 10–100x faster than pip and pip-tools for installation, has a correct and deterministic resolver, and generates a `uv.lock` file that is compatible with pip if needed. It is backed by PyPA and is on a fast improvement trajectory.
+**Context:**
+Delivering a user's following feed requires knowing all users they follow and fetching their recent messages. Two classic approaches exist:
 
-For a new project in 2024+, `uv` is the better starting point. The toolchain (uv + ruff + mypy) is consistent, fast, and well-integrated. Running `uv run pytest` or `uv run ruff check .` is clean and reproducible.
+**Fan-out on write (push):** When a user posts, immediately write that post to each follower's inbox (a Redis sorted set or Postgres table per user). GetFollowFeed reads the inbox directly — O(1) per read.
 
----
+**Fan-out on read (pull):** When a user posts, insert the message into the messages table. GetFollowFeed JOINs follows→messages at query time — O(followers × messages) in the worst case, mitigated by indexes and caching.
 
-## 8. Why composite PK on `follows`?
+Push is appealing for read performance but front-loads the cost onto the write path. A user with 100,000 followers posting a message triggers 100,000 inbox writes synchronously. Either the POST handler blocks until all writes complete (terrible latency), or you queue them asynchronously (requires a job queue, delivery guarantees, dead-letter handling, and a way to surface delivery failures).
 
-The `follows` table represents a relationship: user A follows user B. The natural primary key is the pair `(follower_id, followed_id)`. There is no meaningful reason to introduce a surrogate UUID primary key here.
+**Decision:**
+Implement pull (fan-out on read). On POST /messages, insert the message and invalidate relevant Redis cache keys. GetFollowFeed executes a single SQL JOIN with Postgres, cached in Redis per user with a 2-minute TTL.
 
-The composite PK does two things at once:
-1. Enforces uniqueness at the database level — a user cannot follow another user twice, even if the application has a bug.
-2. Creates an index on `(follower_id, followed_id)`, which serves the `GetFollowFeed` JOIN (`WHERE follower_id = :uid`) efficiently.
+At current scale (small-to-medium follower counts, no celebrity accounts), the JOIN is fast with appropriate indexes. Redis caching further reduces how often the JOIN runs at all. The write path remains O(1).
 
-We also add a separate index on `followed_id` alone, which is needed for the feed invalidation query ("who follows this user?"). The composite PK index covers `follower_id` lookups but not `followed_id` lookups due to column order.
-
-Using a surrogate PK would require adding a separate unique constraint on `(follower_id, followed_id)` anyway, so the composite PK is strictly simpler.
-
----
-
-## 9. Why VARCHAR(140) on `content`?
-
-Content length is validated in the Pydantic request schema (`max_length=140`). That catches the bad input at the API layer. But defense in depth matters: what if someone bypasses the API and writes directly to the DB? What if a future migration removes the Pydantic validator? What if a background job inserts data with a bug?
-
-Enforcing the 140-character limit at the `VARCHAR(140)` column level means the database itself will reject any content that exceeds the limit, regardless of how it got there. The DB constraint is the last line of defense.
-
-This adds essentially zero overhead (VARCHAR enforces length at write time, no performance cost at read time) and prevents a whole class of silent data integrity bugs.
+**Consequences:**
+- POST /messages is simple and fast: one Postgres insert, cache invalidation, done.
+- GetFollowFeed requires a JOIN on cache miss. With the composite index on `follows(follower_id)` and `messages(user_id, created_at DESC)`, this is acceptably fast at MVP scale.
+- At large follower counts (>10K per user), cache miss rate can spike and JOIN latency becomes a problem. Upgrade trigger is defined: when p95 GetFollowFeed latency exceeds threshold, implement fan-out on write with async inbox population. Backlogged as BL-001.
+- Follow/unfollow does not invalidate the cached following feed immediately (BL-008). TTL expiry handles eventual consistency.
 
 ---
 
-## 10. Security Considerations
+## Decision 5: Redis caching strategy for feeds
 
-A few non-obvious security decisions worth documenting explicitly:
+**Status:** Accepted
 
-**bcrypt work factor 12.** bcrypt is intentionally slow — that's the point. Work factor 12 means each hash takes ~250–400ms on modern hardware. That makes offline dictionary attacks and credential stuffing attacks computationally expensive. The downside is that sign-in is slower. This is the correct trade-off: user experience suffers by hundreds of milliseconds, but attacker economics break down. Work factor is configurable; bump to 13 or 14 as hardware gets faster.
+**Context:**
+Feed queries are the most expensive database operations: they involve JOINs, ordering by timestamp, and return multiple rows. These queries run on every feed request. At any meaningful load, hitting Postgres cold on every feed request would saturate the DB quickly.
 
-**httpOnly cookie.** The session cookie is flagged `httpOnly`, which means JavaScript cannot read it. This closes the XSS-to-cookie-theft attack: even if an attacker injects JavaScript into the page, they cannot exfiltrate the session token. `samesite="lax"` prevents the cookie from being sent on cross-site requests (CSRF mitigation).
+The question is not whether to cache feeds, but how: what to cache, for how long, and how to invalidate.
 
-**HTTPS required in production.** The httpOnly cookie provides no protection if the token is sent over plaintext HTTP — a network observer can read it. TLS termination (nginx, Caddy, or a load balancer) is required before exposing this to the internet. Tracked as BL-013.
+**Decision:**
+Cache two feed types in Redis:
 
-**No raw passwords stored or logged.** The raw password is used exactly once: passed to `bcrypt.checkpw()` at sign-in, or `bcrypt.hashpw()` at sign-up. It is never written to the database, never included in log output, never returned in an API response. This is a basic hygiene requirement but worth stating explicitly for audit purposes.
+**Global feed** (`global_feed` key, 300s TTL): All messages ordered by creation time. This is the most expensive query (full messages table scan) and the most shared (identical result for all users). Explicit invalidation on every POST /messages ensures the cache stays fresh. The 300s TTL is a backstop for bugs or missed invalidations.
 
-**JTI-based revocation.** See decision 3. The Redis blacklist ensures sign-out is real and tokens cannot be replayed after logout.
+**Per-user following feed** (`follow_feed:{user_id}` key, 120s TTL): Personalized per user. Invalidated when any user they follow posts a message — on POST, the posting user's followers are queried and their cache keys are deleted. TTL is shorter (2 minutes) because per-user caches are harder to invalidate exhaustively.
+
+Per-user message feeds (`GET /feed/{username}`) are not cached. They are lower-traffic profile views, the query is simpler (no JOIN), and the invalidation logic would add complexity for marginal gain.
+
+Cache misses fall back to Postgres. Cache hits return the serialized JSON directly without touching Postgres.
+
+**Consequences:**
+- Cold-start penalty: the first request after a cache miss hits Postgres. Subsequent requests within the TTL window are served from Redis.
+- Global feed is typically fresh within seconds of a new post (explicit invalidation). Following feed can be up to 2 minutes stale on cache miss, or if invalidation is incomplete (BL-008).
+- Cache keys are stored as JSON-serialized arrays. Serialization/deserialization overhead is small relative to the Postgres query cost it replaces.
+- Only the first page (offset=0) is cached. Paginated requests always hit Postgres. This is intentional — deep page caching would require per-offset keys, multiplying cache storage.
+
+---
+
+## Decision 6: UUID primary keys
+
+**Status:** Accepted
+
+**Context:**
+Postgres supports integer sequences (SERIAL, BIGSERIAL) and UUIDs as primary key types. Integer sequences are smaller (4 or 8 bytes vs 16 bytes for UUID), have predictable sort order, and generate sequential values that are friendlier to B-tree index performance (no fragmentation from random insertion order).
+
+UUIDs have different properties: they are globally unique without coordination between nodes, they do not leak record counts or creation order, and they work well as identifiers in distributed systems where IDs may be generated outside the database.
+
+**Decision:**
+Use `UUID` primary keys for all three tables (users, messages, follows). UUIDs are generated by the application layer (`uuid.uuid4()`) before insertion.
+
+The `sub` claim in the JWT payload carries the username (not the UUID) for human readability in tokens, but internal system references (session checks, feed queries, cache keys) all use the UUID.
+
+**Consequences:**
+- No information leakage: `user_id` values in API responses do not reveal how many users exist or approximate creation order.
+- Random UUID insertion causes B-tree index fragmentation over time as pages split to accommodate out-of-order keys. At current scale, this is not measurable. At very large scale, ULIDs (time-ordered UUIDs) would be worth the migration.
+- 16-byte PKs vs 8-byte BIGINT adds storage overhead on all FK columns. Minor at this scale.
+- No coordination required between distributed nodes if IDs are ever generated outside the DB. Currently moot but provides headroom.
+
+---
+
+## Decision 7: Alembic for schema migrations
+
+**Status:** Accepted
+
+**Context:**
+The database schema needs to evolve over time. Creating tables manually from SQL scripts or using `Base.metadata.create_all()` directly in the application startup both work for development but fail in production scenarios: they have no way to apply incremental changes to an existing database without destroying and recreating it.
+
+**Decision:**
+Use Alembic for schema version management. Migration scripts live in `alembic/versions/`. Each script has `upgrade()` and `downgrade()` functions. `alembic upgrade head` applies all pending migrations; `alembic downgrade -1` rolls back the last one.
+
+The initial migration creates all three tables with their columns, indexes, and foreign key constraints. Subsequent migrations will add columns, add indexes, or modify constraints incrementally without touching existing data.
+
+Alembic integrates naturally with SQLAlchemy: it can compare the in-memory model state (SQLAlchemy ORM classes) against the current DB state and generate migration scripts automatically (`alembic revision --autogenerate`). These auto-generated scripts are reviewed before committing — autogenerate does not always get it right, especially for custom index options.
+
+**Consequences:**
+- Database state is reproducible and auditable. Every schema change is a versioned, reversible script.
+- Deployments are explicit: `alembic upgrade head` must be run (either in a pre-start hook or manually) when deploying a version with schema changes.
+- The `alembic_version` table in Postgres tracks the current migration head. Concurrent deployments running migrations simultaneously can cause lock contention — mitigated by running migrations from a single deployment job, not from every app instance on startup.
+- Autogenerate cannot detect all changes (e.g., renamed columns look like drop + add). Migrations require review.
+
+---
+
+## Decision 8: uv for packaging and dependency management
+
+**Status:** Accepted
+
+**Context:**
+Python packaging tooling has been fragmented for years. The legacy choice (pip + requirements.txt) has no dependency resolver and produces non-reproducible installs. Poetry was the dominant modern choice but has accumulated known issues: slow resolution on complex trees, cross-platform lock file inconsistencies, and occasional resolver bugs requiring manual intervention.
+
+A new project in 2024–2025 has a better option.
+
+**Decision:**
+Use `uv` for all packaging operations: dependency installation (`uv sync`), running project scripts (`uv run pytest`, `uv run alembic`), and lock file generation. The `pyproject.toml` defines dependencies; `uv.lock` pins the exact resolved versions.
+
+`uv` is written in Rust and is 10–100x faster than pip or pip-tools for installation. Its resolver is correct and deterministic. The `uv.lock` file is cross-platform. The toolchain is completed by `ruff` (linting and formatting, also from Astral) and `mypy` (type checking).
+
+**Consequences:**
+- `uv sync` installs the full environment in seconds, even on a clean machine. CI install times drop significantly compared to pip.
+- `uv.lock` ensures that every developer and every CI run uses the exact same dependency versions. "Works on my machine" dependency divergence is eliminated.
+- `uv` is newer than Poetry or pip. Some edge cases may have less community documentation. Not a practical problem at this project's dependency complexity.
+- The `uv run` wrapper handles virtual environment activation transparently. No need to manually activate a venv before running commands.
+- If `uv` becomes unavailable or unsupported, `pyproject.toml` is standard PEP 517 and compatible with pip. The lock file is uv-specific but the project is not otherwise locked in.
