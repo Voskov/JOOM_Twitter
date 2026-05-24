@@ -1,28 +1,26 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
-from jose import JWTError, jwt
-from passlib.context import CryptContext
+import bcrypt
+from jose import jwt  # type: ignore[import-untyped]
 
 from app.config import settings
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 
 def hash_password(plain: str) -> str:
-    return pwd_context.hash(plain)
+    return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    return bcrypt.checkpw(plain.encode(), hashed.encode())
 
 
 def create_access_token(subject: str) -> tuple[str, str]:
     """Returns (token, jti). jti is a unique JWT ID used for blacklisting."""
     jti = str(uuid.uuid4())
-    expire = datetime.now(timezone.utc) + timedelta(minutes=settings.access_token_expire_minutes)
+    expire = datetime.now(UTC) + timedelta(minutes=settings.access_token_expire_minutes)
     payload = {"sub": subject, "jti": jti, "exp": expire}
     token = jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
     return token, jti
@@ -30,4 +28,4 @@ def create_access_token(subject: str) -> tuple[str, str]:
 
 def decode_access_token(token: str) -> dict[str, str]:
     """Raises JWTError if invalid/expired. Returns payload dict."""
-    return jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+    return jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])  # type: ignore[no-any-return]

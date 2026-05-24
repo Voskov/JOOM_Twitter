@@ -1,10 +1,11 @@
 from __future__ import annotations
-import uuid
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete
+
 import redis.asyncio as aioredis
-from app.db.models import User, Message, Follow
-from app.core.exceptions import NotFoundError, ConflictError, ValidationError
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.exceptions import ConflictError, NotFoundError, ValidationError
+from app.db.models import Follow, Message, User
 from app.services.feed_service import invalidate_global_feed_cache
 
 
@@ -72,6 +73,6 @@ async def unfollow_user(
             Follow.followed_id == target.id,
         )
     )
-    if result2.rowcount == 0:
+    if result2.rowcount == 0:  # type: ignore[attr-defined]
         raise NotFoundError(f"Not following '{username_to_unfollow}'")
     await db.commit()

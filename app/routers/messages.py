@@ -1,9 +1,12 @@
 from __future__ import annotations
+
 from typing import Annotated
+
+import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-import redis.asyncio as aioredis
+
 from app.db.database import get_db
 from app.db.models import User
 from app.db.redis_client import get_redis_pool

@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-from fastapi import Depends, Request
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
 import redis.asyncio as aioredis
-from jose import JWTError
+from fastapi import Depends, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import JWTError  # type: ignore[import-untyped]
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.database import get_db
-from app.db.redis_client import get_redis_pool
-from app.db.models import User
-from app.core.security import decode_access_token
 from app.core.exceptions import UnauthorizedError
+from app.core.security import decode_access_token
+from app.db.database import get_db
+from app.db.models import User
+from app.db.redis_client import get_redis_pool
 
 # Optional Bearer — won't auto-raise 403 if missing (we handle cookie fallback)
 _bearer = HTTPBearer(auto_error=False)

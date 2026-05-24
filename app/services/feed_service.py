@@ -1,12 +1,14 @@
 from __future__ import annotations
+
 import json
-from datetime import datetime, timezone
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+
 import redis.asyncio as aioredis
-from app.db.models import User, Message, Follow
-from app.schemas.message import MessageOut, FeedResponse
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.core.exceptions import NotFoundError
+from app.db.models import Follow, Message, User
+from app.schemas.message import FeedResponse, MessageOut
 
 GLOBAL_FEED_KEY = "global_feed"
 GLOBAL_FEED_TTL = 300  # 5 min
@@ -41,7 +43,10 @@ async def get_user_feed(
     )
     result = await db.execute(stmt)
     rows = result.all()
-    items = [MessageOut(id=r[0].id, username=r[1], content=r[0].content, created_at=r[0].created_at) for r in rows]
+    items = [
+        MessageOut(id=r[0].id, username=r[1], content=r[0].content, created_at=r[0].created_at)
+        for r in rows
+    ]
     return FeedResponse(items=items, total=len(items))
 
 async def get_follow_feed(
@@ -70,7 +75,10 @@ async def get_follow_feed(
     )
     result = await db.execute(stmt)
     rows = result.all()
-    items = [MessageOut(id=r[0].id, username=r[1], content=r[0].content, created_at=r[0].created_at) for r in rows]
+    items = [
+        MessageOut(id=r[0].id, username=r[1], content=r[0].content, created_at=r[0].created_at)
+        for r in rows
+    ]
 
     if offset == 0:
         serializable = [item.model_dump(mode="json") for item in items]
@@ -100,7 +108,10 @@ async def get_global_feed(
     )
     result = await db.execute(stmt)
     rows = result.all()
-    items = [MessageOut(id=r[0].id, username=r[1], content=r[0].content, created_at=r[0].created_at) for r in rows]
+    items = [
+        MessageOut(id=r[0].id, username=r[1], content=r[0].content, created_at=r[0].created_at)
+        for r in rows
+    ]
 
     if offset == 0:
         serializable = [item.model_dump(mode="json") for item in items]

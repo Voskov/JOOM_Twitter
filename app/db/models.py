@@ -44,7 +44,12 @@ class Message(Base):
     __tablename__ = "messages"
 
     __table_args__ = (
-        Index("idx_messages_user_created", "user_id", "created_at", postgresql_ops={"created_at": "DESC"}),
+        Index(
+            "idx_messages_user_created",
+            "user_id",
+            "created_at",
+            postgresql_ops={"created_at": "DESC"},
+        ),
         Index("idx_messages_created", "created_at", postgresql_ops={"created_at": "DESC"}),
     )
 
