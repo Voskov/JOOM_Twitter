@@ -50,3 +50,6 @@ Thumbs.db
 
 # Alembic — keep versions tracked, ignore pycache
 alembic/__pycache__/
+
+# Claude Code local settings (machine-specific permissions)
+.claude/settings.local.json

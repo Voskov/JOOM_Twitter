@@ -4,6 +4,10 @@ services:
       POSTGRES_DB: joon_twitter_test
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
   redis:
     # Redis supports multiple DBs by default (16 DBs)
     # Tests use DB index 1 via TEST_REDIS_URL
+    ports:
+      - "6379:6379"
